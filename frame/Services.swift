@@ -127,6 +127,7 @@ protocol MirrorProviding: AnyObject {
     @discardableResult func capturePhoto() -> Bool
     @discardableResult func startRecording() -> Bool
     func stopRecording()
+    func updatePreviewOrientation()
     func setAttentionMonitoring(_ enabled: Bool)
     func resetAttentionBaseline()
 }
@@ -2149,6 +2150,15 @@ nonisolated final class MirrorPreviewRenderer: @unchecked Sendable {
     }
 
     @MainActor
+    func makeRotationCoordinator(for device: AVCaptureDevice) -> AVCaptureDevice.RotationCoordinator? {
+        lock.lock()
+        let layer = displayLayer
+        lock.unlock()
+        guard let layer else { return nil }
+        return AVCaptureDevice.RotationCoordinator(device: device, previewLayer: layer)
+    }
+
+    @MainActor
     func detach(_ layer: AVSampleBufferDisplayLayer) {
         lock.lock()
         let renderer = displayLayer === layer ? videoRenderer : nil
@@ -2458,6 +2468,14 @@ private nonisolated final class MirrorCaptureGraphStore: @unchecked Sendable {
     }
 }
 
+private nonisolated final class WeakMirrorProviderBox: @unchecked Sendable {
+    weak var value: AVFoundationMirrorProvider?
+
+    init(_ value: AVFoundationMirrorProvider) {
+        self.value = value
+    }
+}
+
 @MainActor
 final class AVFoundationMirrorProvider: NSObject, MirrorProviding, AVCaptureFileOutputRecordingDelegate {
     // Reading this property is part of SwiftUI view construction, so it must
@@ -2475,6 +2493,8 @@ final class AVFoundationMirrorProvider: NSObject, MirrorProviding, AVCaptureFile
     var onCaptureResult: ((MirrorCaptureResult) -> Void)?
     private let sessionQueue = DispatchQueue(label: "com.raaghavt.frame.mirror")
     private let captureGraphStore = MirrorCaptureGraphStore()
+    private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+    private var previewRotationObservation: NSKeyValueObservation?
     private let faceMetadataDelegate = LowFrequencyFaceMetadataDelegate()
     private lazy var frameHeartbeatDelegate = MirrorFrameHeartbeatDelegate(
         renderer: previewRenderer
@@ -3572,9 +3592,23 @@ final class AVFoundationMirrorProvider: NSObject, MirrorProviding, AVCaptureFile
         switch orientation {
         case .portrait: return 90
         case .portraitUpsideDown: return 270
-        case .landscapeLeft: return 180
-        case .landscapeRight: return 0
+        // UIInterfaceOrientation names the direction of the interface, which is
+        // opposite the physical device rotation used by the front camera.
+        case .landscapeLeft: return 0
+        case .landscapeRight: return 180
         default: return 0
+        }
+    }
+
+    func updatePreviewOrientation() {
+        let rotationAngle = rotationCoordinator?.videoRotationAngleForHorizonLevelPreview
+            ?? currentCaptureRotationAngle()
+        let graphStore = captureGraphStore
+        sessionQueue.async {
+            guard let graph = graphStore.existing(),
+                  let connection = graph.frameHeartbeatOutput.connection(with: .video),
+                  connection.isVideoRotationAngleSupported(rotationAngle) else { return }
+            connection.videoRotationAngle = rotationAngle
         }
     }
 
@@ -3679,6 +3713,23 @@ final class AVFoundationMirrorProvider: NSObject, MirrorProviding, AVCaptureFile
         Task { @MainActor [weak self] in
             guard let self, self.startRequestID == requestID else { return }
             self.installSessionObserversIfNeeded(for: session)
+            if let device = session.inputs
+                .compactMap({ ($0 as? AVCaptureDeviceInput)?.device })
+                .first(where: { $0.hasMediaType(.video) }),
+               self.rotationCoordinator?.device !== device,
+               let coordinator = self.previewRenderer.makeRotationCoordinator(for: device) {
+                let providerBox = WeakMirrorProviderBox(self)
+                self.previewRotationObservation = coordinator.observe(
+                    \.videoRotationAngleForHorizonLevelPreview,
+                    options: [.initial, .new]
+                ) { _, _ in
+                    Task { @MainActor in
+                        providerBox.value?.updatePreviewOrientation()
+                    }
+                }
+                self.rotationCoordinator = coordinator
+            }
+            self.updatePreviewOrientation()
             self.startWatchdog(for: requestID)
         }
     }

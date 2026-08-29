@@ -1538,7 +1538,8 @@ struct FeedCarouselView: View {
                 // pages. HomeKit feed insertion and page recycling may rebuild a
                 // FeedPageView, but they must never dismantle the live renderer.
                 MirrorPreviewView(
-                    renderer: model.mirrorProvider.previewRenderer
+                    renderer: model.mirrorProvider.previewRenderer,
+                    onLayout: model.mirrorProvider.updatePreviewOrientation
                 )
                     .opacity(
                         model.selectedFeed.isMirror
@@ -4024,10 +4025,12 @@ struct WeatherAttributionView: View {
 
 struct MirrorPreviewView: UIViewRepresentable {
     let renderer: MirrorPreviewRenderer
+    let onLayout: () -> Void
 
     func makeUIView(context: Context) -> MirrorPreviewUIView {
         let view = MirrorPreviewUIView()
         view.renderer = renderer
+        view.onLayout = onLayout
         renderer.attach(view.displayLayer)
         return view
     }
@@ -4037,12 +4040,14 @@ struct MirrorPreviewView: UIViewRepresentable {
             view.renderer?.detach(view.displayLayer)
             view.renderer = renderer
         }
+        view.onLayout = onLayout
         renderer.attach(view.displayLayer)
     }
 
     static func dismantleUIView(_ view: MirrorPreviewUIView, coordinator: ()) {
         view.renderer?.detach(view.displayLayer)
         view.renderer = nil
+        view.onLayout = nil
     }
 }
 
@@ -4050,6 +4055,12 @@ final class MirrorPreviewUIView: UIView {
     override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
     var displayLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
     var renderer: MirrorPreviewRenderer?
+    var onLayout: (() -> Void)?
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        onLayout?()
+    }
 }
 
 struct HomeKitSourceView: UIViewRepresentable {
